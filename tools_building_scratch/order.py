@@ -3,19 +3,24 @@
 from openai import OpenAI
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import os
-import re
+from dotenv import load_dotenv
+load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# print(OPENROUTER_API_KEY)
 
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
 
-MAX_RETRIES = 10
+MAX_ITERATIONS = 10
 TOOL_REGISTRY = {}
 
 ORDER_DB = {
@@ -91,39 +96,46 @@ class CostLimitExceeded(RuntimeError):
 class CostTracker:
     """Tracks LLM API usage costs across multiple calls."""
     
-    def __init__(
-        self,
-        max_cost_usd: float = 1.0,
-        input_cost_per_million: float = 0.0,
-        output_cost_per_million: float = 0.0,
-    ):
-        """Initialize tracker with a maximum allowed cost in USD."""
-        self.total_cost = 0.0
+    def __init__(self, max_cost_usd: float = 0.01):
         self.max_cost = max_cost_usd
-        self.input_cost_per_million = input_cost_per_million
-        self.output_cost_per_million = output_cost_per_million
+        self.total_cost = 0.0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.call_count = 0
     
     def track(self, response):
         """Calculate and accumulate the cost of a single API response."""
         usage = response.usage
-        input_tokens = getattr(usage, "input_tokens", None)
-        if input_tokens is None:
-            input_tokens = getattr(usage, "prompt_tokens", 0)
+        input_tokens = getattr(usage, "prompt_tokens", 0) 
+        output_tokens = getattr(usage, "completion_tokens", 0)
+        call_cost = getattr(usage, "cost", 0.0) or 0.0
 
-        output_tokens = getattr(usage, "output_tokens", None)
-        if output_tokens is None:
-            output_tokens = getattr(usage, "completion_tokens", 0)
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost += call_cost
+        self.call_count += 1
 
-        cost = (
-            input_tokens * self.input_cost_per_million +
-            output_tokens * self.output_cost_per_million
-        ) / 1_000_000
-        self.total_cost += cost
-        
+        logger.info(
+            f"[Call {self.call_count}] "
+            f"input_tokens={input_tokens}, "
+            f"output_tokens={output_tokens}, "
+            f"call_cost=${call_cost:.6f}, "
+            f"total_cost=${self.total_cost:.6f}"
+        )
+
         if self.total_cost > self.max_cost:
             raise CostLimitExceeded(
-                f"Agent exceeded cost limit: ${self.total_cost:.4f} > ${self.max_cost}"
+                f"Agent exceeded cost limit: ${self.total_cost:.6f} > ${self.max_cost:.6f}"
             )
+        
+    def summary(self):
+        logger.info(
+            f"[Cost Summary] "
+            f"calls={self.call_count}, "
+            f"total_input_tokens={self.total_input_tokens}, "
+            f"total_output_tokens={self.total_output_tokens}, "
+            f"total_cost=${self.total_cost:.6f}"
+        )
 
 #tool definations 
 TOOLS = [
@@ -135,6 +147,7 @@ TOOLS = [
                 "Look up an order by ID and return its details "
                 "including delivery date, total, and item count."
             ),
+            "strict": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -156,6 +169,7 @@ TOOLS = [
                 "Read a company policy file. "
                 "Use path 'return_policy.txt' to get the return policy."
             ),
+            "strict": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -174,6 +188,7 @@ TOOLS = [
         "function": {
             "name": "get_current_date",
             "description": "Get today's date in UTC as YYYY-MM-DD.",
+            "strict": True,
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -191,10 +206,8 @@ class Agent:
         self,
         system_prompt: str,
         tools: list[dict],
-        model: str = "gpt-4.1",
+        model="openai/gpt-oss-20b",
         max_cost_usd: float = 1.0,
-        input_cost_per_million: float = 0.0,
-        output_cost_per_million: float = 0.0,
     ):
         """Initialize the agent with constraints and available tools."""
         self.system_prompt = system_prompt
@@ -202,8 +215,6 @@ class Agent:
         self.model = model
         self.cost_tracker = CostTracker(
             max_cost_usd,
-            input_cost_per_million,
-            output_cost_per_million,
         )
         self.messages = [{"role": "system", "content": system_prompt}]
 
@@ -219,7 +230,7 @@ class Agent:
         """Run the agent loop for a given user message."""
         self.messages.append({"role": "user", "content": user_message})
         
-        for _ in range(MAX_RETRIES):
+        for _ in range(MAX_ITERATIONS):
             response = self._call_llm()
             logger.info(f"LLM response: {response}")
             try:
@@ -231,9 +242,11 @@ class Agent:
             
             if choice.finish_reason == "stop":
                 self.messages.append(choice.message.model_dump(exclude_none=True))
+                self.cost_tracker.summary()
                 return choice.message.content or ""
             
             if choice.finish_reason != "tool_calls":
+                self.cost_tracker.summary()
                 return f"Agent stopped unexpectedly: {choice.finish_reason}"
 
             self.messages.append(choice.message.model_dump(exclude_none=True))
@@ -250,6 +263,7 @@ class Agent:
                     result = execute_tool_safe(
                         tool_call.function.name, args
                     )
+                logger.info(f"[Tool] {tool_call.function.name}({args}) → {result}")
                 
                 self.messages.append({
                     "role": "tool",
@@ -257,6 +271,7 @@ class Agent:
                     "content": truncate_result(result),
                 })
         
+        self.cost_tracker.summary()
         return "I reached the maximum number of steps. Here's what I found so far..."
     
 
@@ -269,7 +284,6 @@ Available tools:
 - get_order_status
 - read_file
 - get_current_date
-- check_return_eligibility
 
 Use tools whenever needed.
 """
@@ -317,16 +331,21 @@ Use tools whenever needed.
 # from datetime import datetime, timedelta, timezone
 # import os
 # import re
+# from dotenv import load_dotenv
+# load_dotenv()
 
-# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+## OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 
-# client = OpenAI(api_key=OPENAI_API_KEY)
+# client = OpenAI(
+    # api_key=OPENROUTER_API_KEY,
+    # base_url="https://openrouter.ai/api/v1")
 
 # logging.basicConfig(level=logging.INFO)
 # logger = logging.getLogger("agent")
 
-# MAX_RETRIES = 10
+# MAX_ITERATIONS = 10
 # TOOL_REGISTRY = {}
 
 # ORDER_DB = {
@@ -439,42 +458,49 @@ Use tools whenever needed.
 # class CostLimitExceeded(RuntimeError):
 #     pass
 
-# class CostTracker:
-#     """Tracks LLM API usage costs across multiple calls."""
+#class CostTracker:
+    # """Tracks LLM API usage costs across multiple calls."""
     
-#     def __init__(
-#         self,
-#         max_cost_usd: float = 1.0,
-#         input_cost_per_million: float = 0.0,
-#         output_cost_per_million: float = 0.0,
-#     ):
-#         """Initialize tracker with a maximum allowed cost in USD."""
-#         self.total_cost = 0.0
-#         self.max_cost = max_cost_usd
-#         self.input_cost_per_million = input_cost_per_million
-#         self.output_cost_per_million = output_cost_per_million
+    # def __init__(self, max_cost_usd: float = 0.01):
+    #     self.max_cost = max_cost_usd
+    #     self.total_cost = 0.0
+    #     self.total_input_tokens = 0
+    #     self.total_output_tokens = 0
+    #     self.call_count = 0
     
-#     def track(self, response):
-#         """Calculate and accumulate the cost of a single API response."""
-#         usage = response.usage
-#         input_tokens = getattr(usage, "input_tokens", None)
-#         if input_tokens is None:
-#             input_tokens = getattr(usage, "prompt_tokens", 0)
+    # def track(self, response):
+    #     """Calculate and accumulate the cost of a single API response."""
+    #     usage = response.usage
+    #     input_tokens = getattr(usage, "prompt_tokens", 0) 
+    #     output_tokens = getattr(usage, "completion_tokens", 0)
+    #     call_cost = getattr(usage, "cost", 0.0) or 0.0
 
-#         output_tokens = getattr(usage, "output_tokens", None)
-#         if output_tokens is None:
-#             output_tokens = getattr(usage, "completion_tokens", 0)
+    #     self.total_input_tokens += input_tokens
+    #     self.total_output_tokens += output_tokens
+    #     self.total_cost += call_cost
+    #     self.call_count += 1
 
-#         cost = (
-#             input_tokens * self.input_cost_per_million +
-#             output_tokens * self.output_cost_per_million
-#         ) / 1_000_000
-#         self.total_cost += cost
+    #     logger.info(
+    #         f"[Call {self.call_count}] "
+    #         f"input_tokens={input_tokens}, "
+    #         f"output_tokens={output_tokens}, "
+    #         f"call_cost=${call_cost:.6f}, "
+    #         f"total_cost=${self.total_cost:.6f}"
+    #     )
+
+    #     if self.total_cost > self.max_cost:
+    #         raise CostLimitExceeded(
+    #             f"Agent exceeded cost limit: ${self.total_cost:.6f} > ${self.max_cost:.6f}"
+    #         )
         
-#         if self.total_cost > self.max_cost:
-#             raise CostLimitExceeded(
-#                 f"Agent exceeded cost limit: ${self.total_cost:.4f} > ${self.max_cost}"
-#             )
+    # def summary(self):
+    #     logger.info(
+    #         f"[Cost Summary] "
+    #         f"calls={self.call_count}, "
+    #         f"total_input_tokens={self.total_input_tokens}, "
+    #         f"total_output_tokens={self.total_output_tokens}, "
+    #         f"total_cost=${self.total_cost:.6f}"
+    #     )
 
 # #tool definations 
 # TOOLS = [
@@ -487,6 +513,7 @@ Use tools whenever needed.
 #                 "Internally fetches order details, the return policy, "
 #                 "and the current date to determine eligibility."
 #             ),
+#             "strict": True,
 #             "parameters": {
 #                 "type": "object",
 #                 "properties": {
@@ -510,19 +537,16 @@ Use tools whenever needed.
 #         self,
 #         system_prompt: str,
 #         tools: list[dict],
-#         model: str = "gpt-4.1",
-#         max_cost_usd: float = 1.0,
-#         input_cost_per_million: float = 0.0,
-#         output_cost_per_million: float = 0.0,
+#         model="openai/gpt-oss-20b",
+#         max_cost_usd: float = 1.0
+
 #     ):
 #         """Initialize the agent with constraints and available tools."""
 #         self.system_prompt = system_prompt
 #         self.tools = tools
 #         self.model = model
 #         self.cost_tracker = CostTracker(
-#             max_cost_usd,
-#             input_cost_per_million,
-#             output_cost_per_million,
+#             max_cost_usd
 #         )
 #         self.messages = [{"role": "system", "content": system_prompt}]
 
@@ -538,7 +562,7 @@ Use tools whenever needed.
 #         """Run the agent loop for a given user message."""
 #         self.messages.append({"role": "user", "content": user_message})
         
-#         for _ in range(MAX_RETRIES):
+#         for _ in range(MAX_ITERATIONS):
 #             response = self._call_llm()
 #             logger.info(f"LLM response: {response}")
 #             try:
@@ -550,9 +574,11 @@ Use tools whenever needed.
             
 #             if choice.finish_reason == "stop":
 #                 self.messages.append(choice.message.model_dump(exclude_none=True))
+#                 self.cost_tracker.summary() 
 #                 return choice.message.content or ""
             
 #             if choice.finish_reason != "tool_calls":
+#                 self.cost_tracker.summary()
 #                 return f"Agent stopped unexpectedly: {choice.finish_reason}"
 
 #             self.messages.append(choice.message.model_dump(exclude_none=True))
@@ -569,13 +595,15 @@ Use tools whenever needed.
 #                     result = execute_tool_safe(
 #                         tool_call.function.name, args
 #                     )
+#                logger.info(f"[Tool] {tool_call.function.name}({args}) → {result}")
                 
 #                 self.messages.append({
 #                     "role": "tool",
 #                     "tool_call_id": tool_call.id,
 #                     "content": truncate_result(result),
 #                 })
-        
+# 
+#         self.cost_tracker.summary() 
 #         return "I reached the maximum number of steps. Here's what I found so far..."
     
 
